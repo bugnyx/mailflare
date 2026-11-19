@@ -87,10 +87,12 @@ export async function storeMessageAttachments(
 			const r2Key = `attachments/${messageId}/${id}/${filename}`;
 			const disposition = attachment.disposition ?? "attachment";
 
-			await env.BUCKET.put(r2Key, attachment.content, {
-				httpMetadata: { contentType: attachment.type },
-				customMetadata: { filename, messageId },
-			});
+			if (env.BUCKET) {
+				await env.BUCKET.put(r2Key, attachment.content, {
+					httpMetadata: { contentType: attachment.type },
+					customMetadata: { filename, messageId },
+				});
+			}
 			stored.push({
 				id,
 				messageId,
@@ -113,7 +115,11 @@ export async function storeMessageAttachments(
 			});
 		}
 	} catch (error) {
-		await Promise.all(stored.map((attachment) => env.BUCKET.delete(attachment.r2Key)));
+		if (env.BUCKET) {
+			await Promise.all(
+				stored.map((attachment) => env.BUCKET.delete(attachment.r2Key).catch(() => {})),
+			);
+		}
 		throw error;
 	}
 
@@ -130,6 +136,7 @@ export async function copyMessageAttachments(
 	fromMessageId: string,
 	toMessageId: string,
 ): Promise<AttachmentMetadata[]> {
+	if (!env.BUCKET) return [];
 	const db = getDb(env);
 	const rows = await db.select().from(messageAttachments).where(and(eq(messageAttachments.messageId, fromMessageId), isNull(messageAttachments.trashedAt)));
 	const copied: AttachmentMetadata[] = [];
@@ -170,6 +177,7 @@ export async function loadMessageAttachmentContents(
 	env: CloudflareEnv,
 	messageId: string,
 ): Promise<AttachmentContent[]> {
+	if (!env.BUCKET) return [];
 	const db = getDb(env);
 	const rows = await db.select().from(messageAttachments).where(and(eq(messageAttachments.messageId, messageId), isNull(messageAttachments.trashedAt)));
 	const result: AttachmentContent[] = [];
@@ -202,12 +210,15 @@ export async function deleteMessageAttachment(
 		.limit(1);
 	if (!row) return false;
 	await db.delete(messageAttachments).where(eq(messageAttachments.id, attachmentId));
-	await env.BUCKET.delete(row.r2Key);
+	if (env.BUCKET) {
+		await env.BUCKET.delete(row.r2Key).catch(() => {});
+	}
 	return true;
 }
 
 /** Remove every attachment object of a message; the rows cascade with the message row. */
 export async function deleteMessageAttachmentObjects(env: CloudflareEnv, messageId: string): Promise<void> {
+	if (!env.BUCKET) return;
 	const db = getDb(env);
 	const rows = await db
 		.select({ id: messageAttachments.id, r2Key: messageAttachments.r2Key })
@@ -244,6 +255,7 @@ export async function getAttachmentForUser(
 	messageId: string,
 	attachmentId: string,
 ) {
+	if (!env.BUCKET) return null;
 	const db = getDb(env);
 	const [message] = await db.select().from(messages).where(eq(messages.id, messageId)).limit(1);
 	if (!message) return null;
@@ -279,6 +291,7 @@ export async function getAttachmentForUser(
  */
 export async function assessStoredAttachment(env: CloudflareEnv, attachment: { filename: string; type: string; size: number; r2Key: string }): Promise<AttachmentRisk> {
 	const byName = assessAttachmentRisk(attachment);
+	if (!env.BUCKET) return byName;
 	const isZip = /\.zip$/i.test(attachment.filename) || attachment.type === "application/zip" || attachment.type === "application/x-zip-compressed";
 	if (!isZip || attachment.size < 22) return byName;
 	try {
