@@ -95,18 +95,19 @@ export async function storeMessageAttachments(
 		for (const attachment of attachments) {
 			const id = newId("att");
 			const filename = sanitizeFilename(attachment.filename);
-			const defaultR2Key = `attachments/${messageId}/${id}/${filename}`;
+			const r2Key = `attachments/${messageId}/${id}/${filename}`;
 			const disposition = attachment.disposition ?? "attachment";
-			let r2Key = defaultR2Key;
+			let contentId = attachment.contentId ?? null;
 
 			if (env.BUCKET) {
-				await env.BUCKET.put(defaultR2Key, attachment.content, {
+				await env.BUCKET.put(r2Key, attachment.content, {
 					httpMetadata: { contentType: attachment.type },
 					customMetadata: { filename, messageId },
 				});
-			} else if (attachment.content.byteLength <= MAX_INLINE_DB_ATTACHMENT_BYTES) {
-				r2Key = `${INLINE_B64_PREFIX}${encodeBase64Content(attachment.content)}`;
+			} else if (!contentId && attachment.content.byteLength <= MAX_INLINE_DB_ATTACHMENT_BYTES) {
+				contentId = `${INLINE_B64_PREFIX}${encodeBase64Content(attachment.content)}`;
 			}
+
 			stored.push({
 				id,
 				messageId,
@@ -114,7 +115,7 @@ export async function storeMessageAttachments(
 				type: attachment.type,
 				size: attachment.content.byteLength,
 				disposition,
-				contentId: attachment.contentId ?? null,
+				contentId,
 				r2Key,
 			});
 			await db.insert(messageAttachments).values({
@@ -124,7 +125,7 @@ export async function storeMessageAttachments(
 				contentType: attachment.type,
 				size: attachment.content.byteLength,
 				disposition,
-				contentId: attachment.contentId ?? null,
+				contentId,
 				r2Key,
 			});
 		}
@@ -155,7 +156,7 @@ export async function copyMessageAttachments(
 	const copied: AttachmentMetadata[] = [];
 	for (const row of rows) {
 		const id = newId("att");
-		let r2Key = `attachments/${toMessageId}/${id}/${sanitizeFilename(row.filename)}`;
+		const r2Key = `attachments/${toMessageId}/${id}/${sanitizeFilename(row.filename)}`;
 		if (env.BUCKET) {
 			const object = await env.BUCKET.get(row.r2Key);
 			if (!object) continue;
@@ -163,10 +164,6 @@ export async function copyMessageAttachments(
 				httpMetadata: { contentType: row.contentType },
 				customMetadata: { filename: row.filename, messageId: toMessageId },
 			});
-		} else if (row.r2Key?.startsWith(INLINE_B64_PREFIX)) {
-			r2Key = row.r2Key;
-		} else {
-			continue;
 		}
 		await db.insert(messageAttachments).values({
 			id,
@@ -185,7 +182,7 @@ export async function copyMessageAttachments(
 			type: row.contentType,
 			size: row.size,
 			disposition: row.disposition as "attachment" | "inline",
-			contentId: row.contentId,
+			contentId: row.contentId?.startsWith(INLINE_B64_PREFIX) ? null : row.contentId,
 		});
 	}
 	return copied;
@@ -204,8 +201,8 @@ export async function loadMessageAttachmentContents(
 		if (env.BUCKET) {
 			const object = await env.BUCKET.get(row.r2Key);
 			if (object) content = await object.arrayBuffer();
-		} else if (row.r2Key?.startsWith(INLINE_B64_PREFIX)) {
-			content = decodeBase64Content(row.r2Key.slice(INLINE_B64_PREFIX.length));
+		} else if (row.contentId?.startsWith(INLINE_B64_PREFIX)) {
+			content = decodeBase64Content(row.contentId.slice(INLINE_B64_PREFIX.length));
 		}
 		if (!content) continue;
 		result.push({
@@ -214,7 +211,7 @@ export async function loadMessageAttachmentContents(
 			type: row.contentType,
 			content,
 			disposition: row.disposition as "attachment" | "inline",
-			contentId: row.contentId,
+			contentId: row.contentId?.startsWith(INLINE_B64_PREFIX) ? null : row.contentId,
 		});
 	}
 	return result;
@@ -234,7 +231,7 @@ export async function deleteMessageAttachment(
 		.limit(1);
 	if (!row) return false;
 	await db.delete(messageAttachments).where(eq(messageAttachments.id, attachmentId));
-	if (env.BUCKET && row.r2Key && !row.r2Key.startsWith(INLINE_B64_PREFIX)) {
+	if (env.BUCKET) {
 		await env.BUCKET.delete(row.r2Key).catch(() => {});
 	}
 	return true;
@@ -248,9 +245,8 @@ export async function deleteMessageAttachmentObjects(env: CloudflareEnv, message
 		.select({ id: messageAttachments.id, r2Key: messageAttachments.r2Key })
 		.from(messageAttachments)
 		.where(eq(messageAttachments.messageId, messageId));
-	const r2Keys = rows.map((row) => row.r2Key).filter((key): key is string => !!key && !key.startsWith(INLINE_B64_PREFIX));
 	// A Drive item saved from this attachment keeps the object alive.
-	await deleteUnreferencedObjects(env, db, r2Keys, { attachmentIds: rows.map((row) => row.id) });
+	await deleteUnreferencedObjects(env, db, rows.map((row) => row.r2Key), { attachmentIds: rows.map((row) => row.id) });
 }
 
 export async function listMessageAttachments(
@@ -270,7 +266,7 @@ export async function listMessageAttachments(
 		type: attachment.contentType,
 		size: attachment.size,
 		disposition: attachment.disposition as "attachment" | "inline",
-		contentId: attachment.contentId,
+		contentId: attachment.contentId?.startsWith(INLINE_B64_PREFIX) ? null : attachment.contentId,
 	}));
 }
 
