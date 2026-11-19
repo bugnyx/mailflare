@@ -49,6 +49,10 @@ export type SendEmailInput = {
 	publicOrigin?: string;
 };
 
+type SerializedAttachmentContent = Omit<AttachmentContent, "content"> & {
+	_base64Content?: string;
+};
+
 /** How long a send started from the composer waits before it is delivered. */
 const MAX_RECIPIENTS = 50;
 const MAX_QUEUE_DELAY_SECONDS = 24 * 60 * 60;
@@ -65,6 +69,24 @@ type PreparedDelivery = {
 	headers: Record<string, string>;
 	attachments: AttachmentContent[];
 };
+
+function encodeBase64(buffer: ArrayBuffer): string {
+	const bytes = new Uint8Array(buffer);
+	let binary = "";
+	for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+		binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+	}
+	return btoa(binary);
+}
+
+function decodeBase64ToBuffer(base64: string): ArrayBuffer {
+	const binary = atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index += 1) {
+		bytes[index] = binary.charCodeAt(index);
+	}
+	return bytes.buffer;
+}
 
 function toRecipientList(value: string | string[] | undefined): string[] {
 	const entries = Array.isArray(value) ? value : splitEmailAddressList(value);
@@ -166,7 +188,10 @@ export async function sendEmail(
 			cc,
 			bcc,
 			mailboxId: sender.mailboxId,
-			attachments: attachments.map(({ content: _content, ...attachment }) => attachment),
+			attachments: attachments.map(({ content, ...attachment }): SerializedAttachmentContent => ({
+				...attachment,
+				...(!env.BUCKET && scheduledAt ? { _base64Content: encodeBase64(content) } : {}),
+			})),
 		}),
 		scheduledAt,
 	});
@@ -349,8 +374,15 @@ async function enqueueScheduledDelivery(
 	await enqueueOutboundJob(env, delivery.jobId, delivery.messageId, scheduledAt);
 }
 
-function deliveryFromJob(jobId: string, messageId: string, payload: string): PreparedDelivery {
-	const input = JSON.parse(payload) as SendEmailInput;
+function deliveryFromJob(
+	env: CloudflareEnv,
+	jobId: string,
+	messageId: string,
+	payload: string,
+): PreparedDelivery {
+	const input = JSON.parse(payload) as Omit<SendEmailInput, "attachments"> & {
+		attachments?: SerializedAttachmentContent[];
+	};
 	const to = toRecipientList(input.to);
 	const cc = toRecipientList(input.cc);
 	const bcc = toRecipientList(input.bcc);
@@ -361,8 +393,16 @@ function deliveryFromJob(jobId: string, messageId: string, payload: string): Pre
 	const headers: Record<string, string> = { ...input.headers };
 	if (inReplyTo) headers["In-Reply-To"] = `<${inReplyTo}>`;
 	if (references.length > 0) headers.References = formatMessageIdHeader(references);
+	const fallbackAttachments: AttachmentContent[] = !env.BUCKET && Array.isArray(input.attachments)
+		? input.attachments
+			.filter((att): att is SerializedAttachmentContent & { _base64Content: string } => typeof att._base64Content === "string")
+			.map(({ _base64Content, ...att }) => ({
+				...att,
+				content: decodeBase64ToBuffer(_base64Content),
+			}))
+		: [];
 	return {
-		input,
+		input: { ...input, attachments: undefined },
 		messageId,
 		jobId,
 		from: input.from,
@@ -371,8 +411,17 @@ function deliveryFromJob(jobId: string, messageId: string, payload: string): Pre
 		cc,
 		bcc,
 		headers,
-		attachments: [],
+		attachments: fallbackAttachments,
 	};
+}
+
+async function resolveQueuedAttachments(
+	env: CloudflareEnv,
+	messageId: string,
+	fallbackAttachments: AttachmentContent[],
+): Promise<AttachmentContent[]> {
+	const loaded = await loadMessageAttachmentContents(env, messageId);
+	return loaded.length > 0 || fallbackAttachments.length === 0 ? loaded : fallbackAttachments;
 }
 
 /** With `dueAt`, the claim also requires the job to still hold that send time, so a
@@ -402,9 +451,9 @@ export async function sendScheduledMessageNow(env: CloudflareEnv, messageId: str
 		.where(and(eq(outboundJobs.messageId, messageId), eq(outboundJobs.status, "queued"), isNotNull(outboundJobs.scheduledAt)))
 		.limit(1);
 	if (!job) return false;
-	const delivery = deliveryFromJob(job.id, messageId, job.payload);
+	const delivery = deliveryFromJob(env, job.id, messageId, job.payload);
 	// Load first: a failure here must leave the job queued so the scheduled send can retry.
-	delivery.attachments = await loadMessageAttachmentContents(env, messageId);
+	delivery.attachments = await resolveQueuedAttachments(env, messageId, delivery.attachments);
 	const claimed = await claimJob(db, job.id);
 	if (!claimed.length) return false;
 	await deliverEmail(env, delivery);
@@ -425,7 +474,7 @@ export async function processOutboundQueue(
 	// The job row is authoritative: rescheduling edits it while queued messages
 	// already in flight still carry the old time.
 	const scheduledAt = job.scheduledAt ?? new Date(payload.scheduledAt);
-	const delivery = deliveryFromJob(payload.jobId, payload.messageId, job.payload);
+	const delivery = deliveryFromJob(env, payload.jobId, payload.messageId, job.payload);
 	if (scheduledAt.getTime() > Date.now()) {
 		await enqueueScheduledDelivery(env, delivery, scheduledAt);
 		return;
@@ -440,6 +489,6 @@ export async function processOutboundQueue(
 		if (current?.status === "queued") await processOutboundQueue(env, payload);
 		return;
 	}
-	delivery.attachments = await loadMessageAttachmentContents(env, payload.messageId);
+	delivery.attachments = await resolveQueuedAttachments(env, payload.messageId, delivery.attachments);
 	await deliverEmail(env, delivery);
 }
