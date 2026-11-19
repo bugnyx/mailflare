@@ -33,6 +33,8 @@ export async function POST(request: Request, { params }: DraftAttachmentUploadPa
 		await db.update(agentDraftMetadata).set({ revision: sql`${agentDraftMetadata.revision} + 1`, humanEditedAt: new Date() }).where(eq(agentDraftMetadata.draftId, id));
 		return Response.json({ attachments });
 	} catch (error) {
-		return Response.json({ error: error instanceof Error ? error.message : "Could not add attachments" }, { status: 400 });
+		const rawMessage = error instanceof Error ? error.message : "Could not add attachments";
+		const safeMessage = rawMessage.split("\nparams:")[0] || "Could not add attachments";
+		return Response.json({ error: safeMessage }, { status: 400 });
 	}
 }
